@@ -1,0 +1,33 @@
+# Local environments and credentials
+.venv/
+.env
+.env.*
+!.env.example
+.pypirc
+*.pem
+*.key
+credentials.json
+token.json
+
+# Python caches and builds
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.coverage*
+htmlcov/
+coverage.xml
+.benchmarks/
+.codspeed/
+
+# Agent runtime data and editor state
+.nova/
+conversation_history/
+context_recall/
+.langgraph_api/
+.vscode/
+.idea/
+.DS_Store

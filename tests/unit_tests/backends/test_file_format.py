@@ -1,0 +1,260 @@
+"""Tests for current file data storage format and helpers."""
+
+import base64
+
+import pytest
+from langgraph.graph import END, START, StateGraph
+from langgraph.store.memory import InMemoryStore
+
+from novaagents.backends.state import StateBackend
+from novaagents.backends.store import StoreBackend
+from novaagents.backends.utils import (
+    create_file_data,
+    file_data_to_string,
+    grep_matches_from_files,
+)
+from novaagents.middleware.filesystem import FilesystemState
+
+NS = lambda _rt: ("filesystem",)  # noqa: E731
+
+
+def test_text_round_trip() -> None:
+    fd = create_file_data("hello\nworld")
+    assert isinstance(fd["content"], str)
+    assert fd["content"] == "hello\nworld"
+    assert fd["encoding"] == "utf-8"
+    assert file_data_to_string(fd) == "hello\nworld"
+
+
+def test_legacy_list_content_is_readable() -> None:
+    fd = {"content": ["hello", "world", ""]}
+
+    assert file_data_to_string(fd) == "hello\nworld\n"  # type: ignore[arg-type]
+
+
+def test_empty_legacy_list_content_is_readable() -> None:
+    fd = {"content": []}
+
+    assert file_data_to_string(fd) == ""  # type: ignore[arg-type]
+
+
+def test_legacy_list_content_rejects_non_string_items() -> None:
+    fd = {"content": ["hello", 1]}
+
+    with pytest.raises(TypeError, match="got list"):
+        file_data_to_string(fd)  # type: ignore[arg-type]
+
+
+def test_binary_round_trip() -> None:
+    original = b"\x89PNG\r\n\x1a\n" + b"\x00" * 20
+    b64_str = base64.standard_b64encode(original).decode("ascii")
+    fd = create_file_data(b64_str, encoding="base64")
+    assert fd["content"] == b64_str
+    assert fd["encoding"] == "base64"
+    assert base64.standard_b64decode(fd["content"]) == original
+
+
+@pytest.mark.parametrize("backend_type", [StateBackend, StoreBackend])
+@pytest.mark.parametrize("mode", ["sync", "async"])
+@pytest.mark.parametrize("payload", [b"\xff\xfe\xfd", b"//79"])
+@pytest.mark.parametrize("replace_all", [False, True])
+async def test_text_edit_preserves_binary_uploads(
+    backend_type: type[StateBackend] | type[StoreBackend], mode: str, payload: bytes, *, replace_all: bool
+) -> None:
+    backend = StoreBackend(store=InMemoryStore(), namespace=NS) if backend_type is StoreBackend else StateBackend()
+    path = "/attachment.bin"
+
+    async def exercise(_state: FilesystemState) -> dict:
+        uploaded = await backend.aupload_files([(path, payload)]) if mode == "async" else backend.upload_files([(path, payload)])
+        assert uploaded[0].error is None
+        original = await backend.aread(path) if mode == "async" else backend.read(path)
+        assert original.file_data is not None
+        result = (
+            await backend.aedit(path, "//79", "replacement text", replace_all=replace_all)
+            if mode == "async"
+            else backend.edit(path, "//79", "replacement text", replace_all=replace_all)
+        )
+        after = await backend.aread(path) if mode == "async" else backend.read(path)
+        if payload == b"\xff\xfe\xfd":
+            assert result.error is not None
+            assert "binary" in result.error.lower()
+            assert result.path is None
+            assert result.occurrences is None
+            assert after.file_data == original.file_data
+            expected = payload
+        else:
+            assert result.error is None
+            assert result.occurrences == 1
+            assert after.file_data is not None
+            assert after.file_data["encoding"] == "utf-8"
+            expected = b"replacement text"
+        downloaded = await backend.adownload_files([path]) if mode == "async" else backend.download_files([path])
+        assert downloaded[0].error is None
+        assert downloaded[0].content == expected
+        return {}
+
+    builder = StateGraph(FilesystemState)
+    builder.add_node("exercise", exercise)
+    builder.add_edge(START, "exercise")
+    builder.add_edge("exercise", END)
+    await builder.compile().ainvoke({"messages": []})
+
+
+@pytest.mark.parametrize("backend_type", [StateBackend, StoreBackend])
+@pytest.mark.parametrize("mode", ["sync", "async"])
+@pytest.mark.parametrize("replacement", ["ordinary replacement text", "café\n日本語", "aGVsbG8=", ""])
+async def test_text_write_replaces_binary_encoding(backend_type: type[StateBackend] | type[StoreBackend], mode: str, replacement: str) -> None:
+    backend = StoreBackend(store=InMemoryStore(), namespace=NS) if backend_type is StoreBackend else StateBackend()
+    path = "/notes.txt"
+    binary = b"\xff\xfe\xfd"
+
+    async def exercise(_state: FilesystemState) -> dict:
+        uploaded = await backend.aupload_files([(path, binary)]) if mode == "async" else backend.upload_files([(path, binary)])
+        assert uploaded[0].error is None
+        original = await backend.aread(path) if mode == "async" else backend.read(path)
+        assert original.file_data is not None
+        assert original.file_data["encoding"] == "base64"
+        downloaded = await backend.adownload_files([path]) if mode == "async" else backend.download_files([path])
+        assert downloaded[0].content == binary
+
+        written = await backend.awrite(path, replacement) if mode == "async" else backend.write(path, replacement)
+        assert written.error is None
+        result = await backend.aread(path) if mode == "async" else backend.read(path)
+        assert result.error is None
+        assert result.file_data is not None
+        assert result.file_data["content"] == replacement
+        assert result.file_data["encoding"] == "utf-8"
+        assert result.file_data["created_at"] == original.file_data["created_at"]
+        downloaded = await backend.adownload_files([path]) if mode == "async" else backend.download_files([path])
+        assert downloaded[0].error is None
+        assert downloaded[0].content == replacement.encode("utf-8")
+        return {}
+
+    builder = StateGraph(FilesystemState)
+    builder.add_node("exercise", exercise)
+    builder.add_edge(START, "exercise")
+    builder.add_edge("exercise", END)
+    await builder.compile().ainvoke({"messages": []})
+
+
+def test_store_upload_binary() -> None:
+    mem_store = InMemoryStore()
+    be = StoreBackend(store=mem_store, namespace=NS)
+
+    png_bytes = b"\x89PNG\r\n\x1a\n" + b"\x00" * 50
+    responses = be.upload_files([("/images/test.png", png_bytes)])
+
+    assert len(responses) == 1
+    assert responses[0].error is None
+    item = mem_store.get(("filesystem",), "/images/test.png")
+    assert item is not None
+    assert item.value["encoding"] == "base64"
+    assert isinstance(item.value["content"], str)
+
+
+def test_store_upload_download_binary_round_trip() -> None:
+    mem_store = InMemoryStore()
+    be = StoreBackend(store=mem_store, namespace=NS)
+
+    original_bytes = b"\x89PNG\r\n\x1a\n" + bytes(range(256))
+    be.upload_files([("/images/photo.png", original_bytes)])
+
+    responses = be.download_files(["/images/photo.png"])
+    assert len(responses) == 1
+    assert responses[0].error is None
+    assert responses[0].content == original_bytes
+
+
+def test_store_upload_text() -> None:
+    mem_store = InMemoryStore()
+    be = StoreBackend(store=mem_store, namespace=NS)
+
+    text_bytes = b"Hello, world!\nLine 2"
+    responses = be.upload_files([("/docs/readme.txt", text_bytes)])
+
+    assert len(responses) == 1
+    assert responses[0].error is None
+    item = mem_store.get(("filesystem",), "/docs/readme.txt")
+    assert item is not None
+    assert item.value["encoding"] == "utf-8"
+    assert item.value["content"] == "Hello, world!\nLine 2"
+
+
+def test_grep_new_format() -> None:
+    fd = create_file_data("import os\nprint('hello')\nimport sys")
+    files = {"/src/main.py": fd}
+    result = grep_matches_from_files(files, "import", path="/")
+    assert result.matches is not None
+    assert len(result.matches) == 2
+    assert result.matches[0]["line"] == 1
+    assert result.matches[0]["text"] == "import os"
+    assert result.matches[1]["line"] == 3
+    assert result.matches[1]["text"] == "import sys"
+
+
+def test_grep_glob_filters_by_filename() -> None:
+    files = {
+        "/src/main.py": create_file_data("import os"),
+        "/src/notes.txt": create_file_data("import os"),
+    }
+    result = grep_matches_from_files(files, "import", path="/", glob="*.py")
+    assert result.matches is not None
+    assert len(result.matches) == 1
+    assert result.matches[0]["path"] == "/src/main.py"
+
+
+def test_grep_glob_brace_expansion() -> None:
+    files = {
+        "/a.py": create_file_data("hit"),
+        "/b.md": create_file_data("hit"),
+        "/c.txt": create_file_data("hit"),
+    }
+    result = grep_matches_from_files(files, "hit", path="/", glob="*.{py,md}")
+    assert result.matches is not None
+    paths = sorted(m["path"] for m in result.matches)
+    assert paths == ["/a.py", "/b.md"]
+
+
+def test_grep_glob_matches_nothing() -> None:
+    files = {
+        "/a.py": create_file_data("hit"),
+        "/b.md": create_file_data("hit"),
+    }
+    result = grep_matches_from_files(files, "hit", path="/", glob="*.rs")
+    assert result.matches == []
+
+
+def test_grep_glob_repeated_pattern_stays_correct() -> None:
+    first = {"/x.py": create_file_data("hit"), "/x.md": create_file_data("hit")}
+    second = {"/y.py": create_file_data("hit"), "/y.txt": create_file_data("hit")}
+    r1 = grep_matches_from_files(first, "hit", path="/", glob="*.py")
+    r2 = grep_matches_from_files(second, "hit", path="/", glob="*.py")
+    assert r1.matches is not None
+    assert r2.matches is not None
+    assert [m["path"] for m in r1.matches] == ["/x.py"]
+    assert [m["path"] for m in r2.matches] == ["/y.py"]
+
+
+def test_store_upload_utf8_content_stored_as_text() -> None:
+    mem_store = InMemoryStore()
+    be = StoreBackend(store=mem_store, namespace=NS)
+
+    be.upload_files([("/docs/notes.txt", b"Hello, world!")])
+
+    item = mem_store.get(("filesystem",), "/docs/notes.txt")
+    assert item is not None
+    assert item.value["encoding"] == "utf-8"
+    assert item.value["content"] == "Hello, world!"
+
+
+def test_store_upload_non_utf8_content_stored_as_base64() -> None:
+    mem_store = InMemoryStore()
+    be = StoreBackend(store=mem_store, namespace=NS)
+
+    raw = b"\x89PNG\r\n\x1a\n" + b"\xff\xfe" + b"\x00" * 20
+    be.upload_files([("/images/photo.png", raw)])
+
+    item = mem_store.get(("filesystem",), "/images/photo.png")
+    assert item is not None
+    assert item.value["encoding"] == "base64"
+    assert base64.standard_b64decode(item.value["content"]) == raw

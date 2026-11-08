@@ -1,0 +1,7 @@
+include LICENSE README.md CHANGELOG.md MANAGED_SESSIONS.md THREAT_MODEL.md
+recursive-include novaagents *.py *.md py.typed
+prune tests
+prune examples
+prune scripts
+prune docs
+global-exclude *.py[cod]
